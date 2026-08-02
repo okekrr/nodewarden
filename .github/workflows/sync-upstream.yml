@@ -51,11 +51,12 @@ jobs:
               "$1"
           }
 
-          if [ "$TRIGGER" = "schedule" ]; then
-            # Auto mode: resolve latest upstream release tag.
+          if [ "$TRIGGER" = "schedule" ] || { [ "$TRIGGER" = "workflow_dispatch" ] && [ -z "${MANUAL_INPUT:-}" ]; }; then
+            # Auto mode (scheduled run, or manual run with no target_commit):
+            # resolve latest upstream release tag.
             # Fall back to upstream/main HEAD if no release exists yet, so the
-            # scheduled sync never hard-fails just because GitHub returns no
-            # release payload (rate limit, transient 5xx, or no release cut).
+            # sync never hard-fails just because GitHub returns no release
+            # payload (rate limit, transient 5xx, or no release cut).
             LATEST_TAG=$(api_get "https://api.github.com/repos/shuaiplus/NodeWarden/releases/latest" | jq -r '.tag_name // empty')
             TARGET_SHA=""
             if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
@@ -94,7 +95,8 @@ jobs:
             echo "Manual mode — target: $MANUAL_INPUT ($TARGET_SHA)"
 
           else
-            # Manual mode, blank input: use latest commit on upstream/main
+            # Unreachable: workflow_dispatch with no input is handled above as
+            # auto mode. Kept as a defensive fallback to upstream/main HEAD.
             TARGET_SHA=$(git rev-parse upstream/main)
             {
               echo "mode=manual"
@@ -108,6 +110,7 @@ jobs:
         run: |
           set -euo pipefail
           TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+          MODE="${{ steps.resolve.outputs.mode }}"
           CURRENT_BASE=""
           if [ -f patches/UPSTREAM_BASE ]; then
             CURRENT_BASE=$(tr -d '[:space:]' < patches/UPSTREAM_BASE)
@@ -122,10 +125,23 @@ jobs:
           if [ "$CURRENT_BASE" = "$TARGET_SHA" ] && git apply --reverse --check patches/cronhub.patch >/dev/null 2>&1; then
             echo "Already synced to $TARGET_SHA with CronHub patch applied — skipping."
             echo "needs_update=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "Update needed — target: $TARGET_SHA (current base: ${CURRENT_BASE:-none})"
-            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # Auto mode must never roll back. If the resolved target is an
+          # ancestor of the current base (e.g. latest release tag is older
+          # than the upstream HEAD we already synced to), skip rather than
+          # downgrade. Manual mode is allowed to roll back explicitly.
+          if [ "$MODE" = "auto" ] && [ -n "$CURRENT_BASE" ]; then
+            if git merge-base --is-ancestor "$TARGET_SHA" "$CURRENT_BASE" 2>/dev/null; then
+              echo "Target $TARGET_SHA is not newer than current base $CURRENT_BASE — skipping (auto mode, no rollback)."
+              echo "needs_update=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Update needed — target: $TARGET_SHA (current base: ${CURRENT_BASE:-none})"
+          echo "needs_update=true" >> "$GITHUB_OUTPUT"
 
       - name: Snapshot custom overlay
         if: steps.check.outputs.needs_update == 'true'
