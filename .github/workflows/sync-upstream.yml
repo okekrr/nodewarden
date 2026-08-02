@@ -1,0 +1,207 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      target_commit:
+        description: 'Commit hash or tag (leave blank to use latest upstream/main)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream
+        run: |
+          git remote add upstream https://github.com/shuaiplus/NodeWarden.git || true
+          git fetch upstream --tags
+
+      - name: Resolve target commit
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TRIGGER="${{ github.event_name }}"
+          MANUAL_INPUT="${{ github.event.inputs.target_commit }}"
+
+          # Authenticated request — uses the workflow's GITHUB_TOKEN to avoid
+          # the 60 req/h anonymous rate limit that intermittently breaks
+          # `curl api.github.com/.../releases/latest` in CI.
+          api_get() {
+            curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          if [ "$TRIGGER" = "schedule" ]; then
+            # Auto mode: resolve latest upstream release tag.
+            # Fall back to upstream/main HEAD if no release exists yet, so the
+            # scheduled sync never hard-fails just because GitHub returns no
+            # release payload (rate limit, transient 5xx, or no release cut).
+            LATEST_TAG=$(api_get "https://api.github.com/repos/shuaiplus/NodeWarden/releases/latest" | jq -r '.tag_name // empty')
+            TARGET_SHA=""
+            if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "null" ]; then
+              TARGET_SHA=$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null || true)
+            fi
+
+            if [ -z "$TARGET_SHA" ]; then
+              echo "No usable upstream release tag (got: '${LATEST_TAG:-none}') — falling back to upstream/main HEAD."
+              TARGET_SHA=$(git rev-parse upstream/main)
+              {
+                echo "mode=auto"
+                echo "latest_tag=${LATEST_TAG:-}"
+                echo "target_sha=$TARGET_SHA"
+              } >> "$GITHUB_OUTPUT"
+              echo "Auto mode (fallback) — upstream/main: $TARGET_SHA"
+            else
+              {
+                echo "mode=auto"
+                echo "latest_tag=$LATEST_TAG"
+                echo "target_sha=$TARGET_SHA"
+              } >> "$GITHUB_OUTPUT"
+              echo "Auto mode — latest release: $LATEST_TAG ($TARGET_SHA)"
+            fi
+
+          elif [ -n "${MANUAL_INPUT:-}" ]; then
+            # Manual mode: use provided commit hash or tag
+            TARGET_SHA=$(git rev-parse "$MANUAL_INPUT" 2>/dev/null || true)
+            if [ -z "$TARGET_SHA" ]; then
+              echo "Cannot resolve '$MANUAL_INPUT' to a commit."
+              exit 1
+            fi
+            {
+              echo "mode=manual"
+              echo "target_sha=$TARGET_SHA"
+            } >> "$GITHUB_OUTPUT"
+            echo "Manual mode — target: $MANUAL_INPUT ($TARGET_SHA)"
+
+          else
+            # Manual mode, blank input: use latest commit on upstream/main
+            TARGET_SHA=$(git rev-parse upstream/main)
+            {
+              echo "mode=manual"
+              echo "target_sha=$TARGET_SHA"
+            } >> "$GITHUB_OUTPUT"
+            echo "Manual mode — latest commit: $TARGET_SHA"
+          fi
+
+      - name: Check if update is needed
+        id: check
+        run: |
+          set -euo pipefail
+          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+          CURRENT_BASE=""
+          if [ -f patches/UPSTREAM_BASE ]; then
+            CURRENT_BASE=$(tr -d '[:space:]' < patches/UPSTREAM_BASE)
+          fi
+
+          if [ ! -f patches/cronhub.patch ]; then
+            echo "Missing patches/cronhub.patch — cannot sync with overlay strategy."
+            exit 1
+          fi
+
+          # Already on this upstream base and CronHub patch is currently applied.
+          if [ "$CURRENT_BASE" = "$TARGET_SHA" ] && git apply --reverse --check patches/cronhub.patch >/dev/null 2>&1; then
+            echo "Already synced to $TARGET_SHA with CronHub patch applied — skipping."
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update needed — target: $TARGET_SHA (current base: ${CURRENT_BASE:-none})"
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Snapshot custom overlay
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/nodewarden-overlay
+          mkdir -p /tmp/nodewarden-overlay/.github/workflows
+          cp -a .github/workflows/sync-upstream.yml /tmp/nodewarden-overlay/.github/workflows/
+          cp -a patches /tmp/nodewarden-overlay/
+          echo "Overlay snapshot ready."
+          ls -la /tmp/nodewarden-overlay /tmp/nodewarden-overlay/patches
+
+      - name: Reset to upstream and re-apply CronHub patch
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          TARGET_SHA="${{ steps.resolve.outputs.target_sha }}"
+          LATEST_TAG="${{ steps.resolve.outputs.latest_tag }}"
+
+          git checkout main
+          git reset --hard "$TARGET_SHA"
+
+          # Restore fork-only overlay that upstream does not ship.
+          mkdir -p .github/workflows
+          cp -a /tmp/nodewarden-overlay/.github/workflows/sync-upstream.yml .github/workflows/
+          rm -rf patches
+          cp -a /tmp/nodewarden-overlay/patches .
+
+          # Apply local CronHub customization on clean upstream tree.
+          if ! git apply --check patches/cronhub.patch; then
+            {
+              echo "### Sync failed: CronHub patch no longer applies"
+              echo ""
+              echo "Upstream \`$TARGET_SHA\` changed files touched by \`patches/cronhub.patch\`."
+              echo "Refresh the patch locally (see \`patches/README.md\`) and re-run this workflow."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "CronHub patch does not apply cleanly to $TARGET_SHA"
+            git apply --check patches/cronhub.patch || true
+            exit 1
+          fi
+
+          git apply patches/cronhub.patch
+          printf '%s\n' "$TARGET_SHA" > patches/UPSTREAM_BASE
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes after reset+patch — nothing to commit."
+            exit 0
+          fi
+
+          if [ -n "${LATEST_TAG:-}" ]; then
+            MSG="chore: sync upstream ${LATEST_TAG} (reset + CronHub patch)"
+          else
+            MSG="chore: sync upstream ${TARGET_SHA:0:7} (reset + CronHub patch)"
+          fi
+          git commit -m "$MSG"
+          echo "Created sync commit: $(git rev-parse --short HEAD)"
+
+      - name: Push
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          set -euo pipefail
+          # History is rewritten to upstream + one overlay commit.
+          git push origin main --force
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.check.outputs.needs_update }}" = "true" ]; then
+            {
+              echo "### Synced successfully (reset + patch)"
+              echo "- **Mode:** ${{ steps.resolve.outputs.mode }}"
+              echo "- **Tag:** ${{ steps.resolve.outputs.latest_tag || 'N/A (manual)' }}"
+              echo "- **Upstream commit:** \`${{ steps.resolve.outputs.target_sha }}\`"
+              echo "- **Strategy:** \`git reset --hard\` + apply \`patches/cronhub.patch\` + force-push"
+              echo "- **HEAD:** \`$(git rev-parse HEAD)\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Nothing to update" >> "$GITHUB_STEP_SUMMARY"
+          fi
