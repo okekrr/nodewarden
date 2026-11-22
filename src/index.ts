@@ -53,6 +53,55 @@ async function maybeServeAsset(request: Request, env: Env): Promise<Response | n
   return addSearchIndexHeaders(request, response);
 }
 
+
+async function timingSafeEqualText(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const leftInput = enc.encode(a || '');
+  const rightInput = enc.encode(b || '');
+  if (leftInput.byteLength !== rightInput.byteLength) return false;
+  const leftDigest = await crypto.subtle.digest('SHA-256', leftInput);
+  const rightDigest = await crypto.subtle.digest('SHA-256', rightInput);
+  const left = new Uint8Array(leftDigest);
+  const right = new Uint8Array(rightDigest);
+  let diff = 0;
+  for (let i = 0; i < left.length; i += 1) diff |= left[i] ^ right[i];
+  return diff === 0;
+}
+
+async function verifyCronHub(request: Request, env: Env): Promise<boolean> {
+  const configured = env.CRONHUB_TOKEN || '';
+  if (!configured) return false;
+  const provided = request.headers.get('x-cronhub-token') || request.headers.get('authorization')?.replace(/^Bearer\s+/i, '') || '';
+  return timingSafeEqualText(provided, configured);
+}
+
+async function handleCronHubScheduledBackup(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (!await verifyCronHub(request, env)) {
+    return jsonResponse({ error: 'Unauthorized' }, 401);
+  }
+
+  const url = new URL(request.url);
+  if (url.searchParams.get('dry') === '1') {
+    return jsonResponse({ ok: true, dryRun: true, trigger: 'cronhub', time: new Date().toISOString() });
+  }
+
+  const run = runScheduledBackupIfDue(env);
+  if (url.searchParams.get('async') === '0') {
+    try {
+      await run;
+      return jsonResponse({ ok: true, trigger: 'cronhub', time: new Date().toISOString() });
+    } catch (error) {
+      console.error('CronHub scheduled backup failed:', error);
+      return jsonResponse({ error: 'CronHub scheduled backup failed' }, 500);
+    }
+  }
+
+  ctx.waitUntil(run.catch((error) => {
+    console.error('CronHub scheduled backup failed:', error);
+  }));
+  return jsonResponse({ ok: true, queued: true, trigger: 'cronhub', time: new Date().toISOString() }, 202);
+}
+
 async function ensureDatabaseInitialized(env: Env): Promise<void> {
   if (dbInitialized) return;
 
@@ -106,6 +155,12 @@ export default {
         500
       );
       return applyCors(normalizedRequest, resp, env);
+    }
+
+    const normalizedUrl = new URL(normalizedRequest.url);
+    if (normalizedUrl.pathname === '/api/cron/scheduled-backup' && normalizedRequest.method === 'POST') {
+      const cronResp = await handleCronHubScheduledBackup(normalizedRequest, env, ctx);
+      return applyCors(normalizedRequest, cronResp, env);
     }
 
     const resp = await handleRequest(normalizedRequest, env);
